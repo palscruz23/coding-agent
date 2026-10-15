@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from myagent import agent
+from coding_agent import agent
 
 
 def response(*, text="", calls=(), status="completed", response_id="resp_first"):
@@ -46,6 +46,42 @@ def test_final_answer_preserves_conversation_id(fake_api, tmp_path, previous_id)
         assert request["previous_response_id"] == previous_id
 
 
+@pytest.mark.parametrize("supply_client", [False, True], ids=["default", "supplied"])
+def test_client_selection_persists_across_model_turns(
+    monkeypatch, tmp_path, supply_client
+):
+    """Check client selection and reuse across a tool request and final answer.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Fixture replacing the SDK constructor.
+        tmp_path (Path): Empty disposable workspace supplied by pytest.
+        supply_client (bool): Whether to pass a client explicitly to respond.
+
+    Returns:
+        None: Assertions verify client construction and both model requests.
+    """
+    create = AsyncMock(side_effect=[
+        response(calls=[tool_call()], response_id="resp_tool"),
+        response(text="Finished", response_id="resp_final"),
+    ])
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    factory = Mock(return_value=client)
+    monkeypatch.setattr(agent, "AsyncOpenAI", factory)
+    options = {"client": client} if supply_client else {}
+
+    result = asyncio.run(agent.respond("List files", None, tmp_path, **options))
+
+    assert result == ("Finished", "resp_final")
+    assert create.await_count == 2
+    if supply_client:
+        factory.assert_not_called()
+    else:
+        factory.assert_called_once_with()
+    follow_up = create.await_args_list[1].kwargs
+    assert follow_up["previous_response_id"] == "resp_tool"
+    assert follow_up["input"][0]["call_id"] == "call_files"
+
+
 def test_tool_result_returns_to_model_with_matching_ids(fake_api, tmp_path):
     (tmp_path / "main.py").write_text("# fixture\n", encoding="utf-8")
     (tmp_path / "src").mkdir()
@@ -74,9 +110,9 @@ def test_tool_result_returns_to_model_with_matching_ids(fake_api, tmp_path):
     [
         (response(status="incomplete"), "status: incomplete"),
         (response(), "no text"),
-        (response(calls=[tool_call(), tool_call(call_id="call_other")]), "Multiple tool calls"),
+        (response(calls=[tool_call(call_id=f"call_{i}") for i in range(5)]), "per-turn tool-call limit"),
     ],
-    ids=["incomplete", "empty", "multiple-tool-calls"],
+    ids=["incomplete", "empty", "oversized-batch"],
 )
 def test_invalid_first_response_fails_before_dispatch(
     fake_api, monkeypatch, tmp_path, bad_response, error
@@ -141,20 +177,72 @@ def test_successive_tool_turns(fake_api, tmp_path):
         }]
 
 
-@pytest.mark.parametrize("final_requests_tool", [False, True], ids=["answer", "tool"])
-def test_final_turn_disables_tools_and_enforces_limit(
-    fake_api, monkeypatch, tmp_path, final_requests_tool
+@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("invalid_first", [False, True])
+def test_batch_results_preserve_identity_after_tool_failure(
+    fake_api, tmp_path, capsys, batch_size, invalid_first
 ):
-    """Check final-turn answering and rejection of an unexpected fifth tool.
+    """Verify batch boundaries, result identity, and continuation after errors.
+
+    Args:
+        fake_api (AsyncMock): Fake Responses API create method.
+        tmp_path (Path): Empty disposable workspace for successful list calls.
+        capsys (pytest.CaptureFixture[str]): Captures user-facing execution logs.
+        batch_size (int): Number of tool calls in an accepted batch.
+        invalid_first (bool): Whether the first call has malformed JSON.
+
+    Returns:
+        None: Assertions check every result and the literal action description.
+    """
+    calls = [
+        tool_call(
+            call_id=f"call_{index}",
+            arguments="{" if invalid_first and index == 0 else "{}",
+        )
+        for index in range(batch_size)
+    ]
+    fake_api.side_effect = [
+        response(text="Inspect [files].", calls=calls, response_id="resp_batch"),
+        response(text="Finished", response_id="resp_final"),
+    ]
+
+    assert asyncio.run(agent.respond("Inspect files", None, tmp_path)) == (
+        "Finished", "resp_final"
+    )
+    assert fake_api.await_count == 2
+    follow_up = fake_api.await_args_list[1].kwargs
+    assert follow_up["previous_response_id"] == "resp_batch"
+    outputs = follow_up["input"]
+    assert len(outputs) == batch_size
+    for index, item in enumerate(outputs):
+        assert item["type"] == "function_call_output"
+        assert item["call_id"] == f"call_{index}"
+        result = json.loads(item["output"])
+        if invalid_first and index == 0:
+            assert result["error"]["type"] == "JSONDecodeError"
+        else:
+            assert result == []
+    output = capsys.readouterr().out
+    assert "Step 1: Inspect [files]." in output
+    assert output.count("Running list_files:") == batch_size
+
+
+@pytest.mark.parametrize("final_requests_tool", [False, True], ids=["answer", "tool"])
+@pytest.mark.parametrize("max_steps", [1, 3, 5])
+def test_final_turn_disables_tools_and_enforces_limit(
+    fake_api, monkeypatch, tmp_path, final_requests_tool, max_steps
+):
+    """Check final-turn answering and rejection of a tool beyond the budget.
 
     Args:
         fake_api (AsyncMock): Mock Responses API create method.
         monkeypatch (pytest.MonkeyPatch): Fixture replacing tool dispatch.
         tmp_path (Path): Disposable workspace passed to the agent.
-        final_requests_tool (bool): Whether turn five violates tool_choice none.
+        final_requests_tool (bool): Whether the final turn requests a tool.
+        max_steps (int): Positive model-turn budget under test.
 
     Returns:
-        None: Assertions verify five model requests and four tool executions.
+        None: Assertions verify the model budget and one fewer tool executions.
     """
     dispatch = Mock(return_value=[])
     monkeypatch.setattr(agent, "execute_tool", dispatch)
@@ -163,7 +251,7 @@ def test_final_turn_disables_tools_and_enforces_limit(
             calls=[tool_call(call_id=f"call_{index}")],
             response_id=f"resp_{index}",
         )
-        for index in range(4)
+        for index in range(max_steps - 1)
     ] + [
         response(calls=[tool_call(call_id="call_forbidden")])
         if final_requests_tool
@@ -172,22 +260,50 @@ def test_final_turn_disables_tools_and_enforces_limit(
 
     if final_requests_tool:
         with pytest.raises(RuntimeError, match="model-turn limit"):
-            asyncio.run(agent.respond("Keep inspecting", None, tmp_path))
+            asyncio.run(agent.respond(
+                "Keep inspecting", None, tmp_path, max_steps=max_steps
+            ))
     else:
-        assert asyncio.run(agent.respond("Keep inspecting", None, tmp_path)) == (
+        assert asyncio.run(agent.respond(
+            "Keep inspecting", None, tmp_path, max_steps=max_steps
+        )) == (
             "Finished", "resp_final"
         )
 
-    assert fake_api.await_count == 5
-    assert dispatch.call_count == 4
+    assert fake_api.await_count == max_steps
+    assert dispatch.call_count == max_steps - 1
     requests = [entry.kwargs for entry in fake_api.await_args_list]
-    assert [request["tool_choice"] for request in requests] == [
-        "auto", "auto", "auto", "auto", "none"
-    ]
-    assert all(request["parallel_tool_calls"] is False for request in requests)
+    assert [request["tool_choice"] for request in requests] == (
+        ["auto"] * (max_steps - 1) + ["none"]
+    )
+    assert all(request["parallel_tool_calls"] is True for request in requests)
     for index, request in enumerate(requests[1:]):
         assert request["previous_response_id"] == f"resp_{index}"
         assert request["input"][0]["call_id"] == f"call_{index}"
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, False, 1.5, "3", None])
+def test_invalid_budget_fails_before_client_creation(monkeypatch, tmp_path, budget):
+    """Reject invalid budgets before creating a client or dispatching tools.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Fixture replacing client and dispatcher.
+        tmp_path (Path): Disposable workspace passed to the agent.
+        budget (object): Invalid model-turn budget under test.
+
+    Returns:
+        None: Assertions verify ValueError and no client or tool activity.
+    """
+    client_factory = Mock()
+    dispatch = Mock()
+    monkeypatch.setattr(agent, "AsyncOpenAI", client_factory)
+    monkeypatch.setattr(agent, "execute_tool", dispatch)
+
+    with pytest.raises(ValueError, match="max_steps must be a positive integer"):
+        asyncio.run(agent.respond("Hello", None, tmp_path, max_steps=budget))
+
+    client_factory.assert_not_called()
+    dispatch.assert_not_called()
 
 
 def test_tool_validation_error_is_returned_before_recovery(fake_api, tmp_path):

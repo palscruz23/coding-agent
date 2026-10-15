@@ -1,4 +1,4 @@
-"""Smoke tests for the installed MyAgent console command."""
+"""Smoke tests for the installed Coding Agent console command."""
 
 import subprocess
 from pathlib import Path
@@ -8,7 +8,7 @@ import pytest
 
 def test_version() -> None:
     result = subprocess.run(
-        ["myagent", "--version"],
+        ["coding-agent", "--version"],
         input="",
         capture_output=True,
         text=True,
@@ -16,12 +16,12 @@ def test_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "myagent 0.1.0"
+    assert result.stdout.strip() == "coding-agent 0.1.0"
 
 
 def test_missing_workspace(tmp_path: Path) -> None:
     result = subprocess.run(
-        ["myagent", "--workspace", str(tmp_path / "missing")],
+        ["coding-agent", "--workspace", str(tmp_path / "missing")],
         input="",
         capture_output=True,
         text=True,
@@ -34,7 +34,7 @@ def test_missing_workspace(tmp_path: Path) -> None:
 
 def test_explicit_workspace(tmp_path: Path) -> None:
     result = subprocess.run(
-        ["myagent", "--workspace", str(tmp_path.resolve())],
+        ["coding-agent", "--workspace", str(tmp_path.resolve())],
         input="",
         capture_output=True,
         text=True,
@@ -47,7 +47,7 @@ def test_explicit_workspace(tmp_path: Path) -> None:
 
 def test_default_workspace(tmp_path: Path) -> None:
     result = subprocess.run(
-        ["myagent"],
+        ["coding-agent"],
         cwd=tmp_path,
         input="",
         capture_output=True,
@@ -61,7 +61,7 @@ def test_default_workspace(tmp_path: Path) -> None:
 
 def test_help() -> None:
     result = subprocess.run(
-        ["myagent", "--help"], input="", capture_output=True, text=True, timeout=5
+        ["coding-agent", "--help"], input="", capture_output=True, text=True, timeout=5
     )
 
     assert result.returncode == 0, result.stderr
@@ -71,7 +71,7 @@ def test_help() -> None:
 
 def test_unknown_argument() -> None:
     result = subprocess.run(
-        ["myagent", "--unknown"], input="", capture_output=True, text=True, timeout=5
+        ["coding-agent", "--unknown"], input="", capture_output=True, text=True, timeout=5
     )
 
     assert result.returncode == 2, result.stderr
@@ -82,7 +82,7 @@ def test_file_workspace(tmp_path: Path) -> None:
     workspace_file = tmp_path / "example.txt"
     workspace_file.write_text("example", encoding="utf-8")
     result = subprocess.run(
-        ["myagent", "--workspace", str(workspace_file)],
+        ["coding-agent", "--workspace", str(workspace_file)],
         input="",
         capture_output=True,
         text=True,
@@ -97,7 +97,7 @@ def test_relative_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "project with spaces"
     workspace.mkdir()
     result = subprocess.run(
-        ["myagent", "--workspace", workspace.name],
+        ["coding-agent", "--workspace", workspace.name],
         cwd=tmp_path,
         input="",
         capture_output=True,
@@ -114,7 +114,7 @@ def test_launch_from_other_project(tmp_path: Path, project_name: str) -> None:
     project = tmp_path / project_name
     project.mkdir()
     result = subprocess.run(
-        ["myagent"],
+        ["coding-agent"],
         cwd=project,
         input="",
         capture_output=True,

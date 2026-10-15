@@ -6,7 +6,7 @@ import os
 import pytest
 from pathlib import Path
 
-from myagent.tools.files import MAX_FILE_BYTES, allowed_file, execute_tool, list_files, read_file, safe_path
+from coding_agent.tools.files import MAX_FILE_BYTES, allowed_file, execute_tool, list_files, read_file, safe_path
 
 
 def test_listing_is_sorted_and_nonrecursive(tmp_path):
@@ -51,7 +51,7 @@ def test_dispatch_rejects_invalid_requests_before_listing(monkeypatch, tmp_path,
     def unexpected_listing(workspace):
         pytest.fail("Invalid request must not access the directory")
 
-    monkeypatch.setattr("myagent.tools.files.list_files", unexpected_listing)
+    monkeypatch.setattr("coding_agent.tools.files.list_files", unexpected_listing)
     with pytest.raises(ValueError):
         execute_tool(tmp_path, name, arguments)
 
@@ -148,7 +148,7 @@ def test_file_policy_rejects_secrets_and_unsupported_paths(requested):
 
 
 def test_file_policy_honors_configured_deny_patterns(monkeypatch):
-    monkeypatch.setattr("myagent.tools.files.DENIED_PATTERNS", ("*.json",))
+    monkeypatch.setattr("coding_agent.tools.files.DENIED_PATTERNS", ("*.json",))
     assert allowed_file(Path("data.json")) is False
     assert allowed_file(Path("main.py")) is True
 
@@ -237,7 +237,7 @@ def test_read_file_blocks_symlink_swap_after_validation(monkeypatch, tmp_path):
         file.symlink_to(outside)
         return resolved
 
-    monkeypatch.setattr("myagent.tools.files.safe_path", resolve_then_swap)
+    monkeypatch.setattr("coding_agent.tools.files.safe_path", resolve_then_swap)
     with pytest.raises((PermissionError, OSError)):
         read_file(workspace, "notes.txt")
 
@@ -258,7 +258,7 @@ def test_read_file_blocks_parent_symlink_swap_before_open(monkeypatch, tmp_path)
         folder.symlink_to(outside, target_is_directory=True)
         return resolved
 
-    monkeypatch.setattr("myagent.tools.files.safe_path", resolve_then_swap)
+    monkeypatch.setattr("coding_agent.tools.files.safe_path", resolve_then_swap)
     with pytest.raises(OSError):
         read_file(workspace, "src/main.py")
 
