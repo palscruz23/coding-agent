@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import stat
@@ -176,26 +177,29 @@ def read_file(workspace: Path, path: str) -> dict[str, str]:
 
 def execute_tool(
     workspace: Path, name: str, arguments: str
-) -> list[str] | dict[str, str]:
+) -> list[str] | dict[str, object]:
     """Validate JSON arguments and dispatch a supported workspace tool.
 
     Args:
-        workspace (Path): Directory used for listing or reading files.
-        name (str): Supported tool name: 'list_files' or 'read_file'.
-        arguments (str): JSON object string; '{}' for list_files or an object
-            with exactly one nonempty string 'path' field for read_file.
+        workspace (Path): Directory that bounds tool access.
+        name (str): Tool name: list_files, read_file, search_text,
+            or find_symbols.
+        arguments (str): JSON object string. list_files requires no fields;
+            read_file and find_symbols require exactly path; search_text
+            requires exactly path and query. Path must be a nonblank string.
 
     Returns:
-        list[str] | dict[str, str]: Sorted entry names for list_files, or a
-            dictionary containing 'path' and 'content' for read_file.
+        list[str] | dict[str, object]: Entry names for list_files; path and
+            content for read_file; path, matches, and truncated for
+            search_text; or path, symbols, and truncated for find_symbols.
 
     Raises:
-        ValueError: The tool name or arguments are invalid, JSON decoding fails,
-            or read_file rejects the file's type, size, or content.
-        PermissionError: File access is blocked by the workspace policy.
+        ValueError: The tool is unknown, JSON or arguments are invalid,
+            or the selected tool rejects the file's type or content.
+        PermissionError: File access violates the workspace policy.
         OSError: A filesystem operation fails.
     """
-    if name not in {"list_files", "read_file"}:
+    if name not in {"list_files", "read_file", "search_text", "find_symbols"}:
         raise ValueError(f"Unknown tool: {name}")
 
     parsed = json.loads(arguments)
@@ -207,11 +211,139 @@ def execute_tool(
             raise ValueError("list_files requires an empty object")
         return list_files(workspace)
 
-    if set(parsed) != {"path"}:
-        raise ValueError("read_file requires exactly one path argument")
+    if name == "search_text":
+        if set(parsed) != {"path", "query"}:
+            raise ValueError("search_text requires exactly path and query")
+    else:
+        if set(parsed) != {"path"}:
+            raise ValueError(f"{name} requires exactly one path argument")
 
     path = parsed["path"]
     if not isinstance(path, str) or not path.strip():
         raise ValueError("path must be a nonempty string")
 
-    return read_file(workspace, path)
+    if name == "read_file":
+        return read_file(workspace, path)
+
+    if name == "find_symbols":
+        return find_symbols(workspace, path)
+
+    return search_text(workspace, path, parsed["query"])
+
+
+def search_text(
+    workspace: Path,
+    path: str,
+    query: str,
+    *,
+    max_matches: int = 20,
+) -> dict[str, object]:
+    """Find literal, case-sensitive text in one permitted workspace file.
+
+    Args:
+        workspace (Path): Directory that bounds file access.
+        path (str): Workspace-relative file path passed to read_file.
+        query (str): Nonempty literal substring to find within each line.
+        max_matches (int): Maximum matching lines returned, from 1 through 100.
+            Defaults to 20. Booleans are rejected.
+
+    Returns:
+        dict[str, object]: Resolved relative 'path', a 'matches' list containing
+            one-based 'line' numbers and 'text', and a 'truncated' boolean.
+            Each matching line appears once, regardless of occurrence count.
+            Truncated is True only when additional matching lines exist.
+
+    Raises:
+        ValueError: Query or limit is invalid, or read_file rejects the content.
+        PermissionError: File access is blocked by the workspace policy.
+        OSError: The workspace or file cannot be accessed.
+    """
+    if not isinstance(query, str) or not query:
+        raise ValueError("query must be a nonempty string")
+
+    if isinstance(max_matches, bool) or not isinstance(max_matches, int):
+        raise ValueError("max_matches must be an integer from 1 through 100")
+
+    if not 1 <= max_matches <= 100:
+        raise ValueError("max_matches must be an integer from 1 through 100")
+
+    document = read_file(workspace, path)
+    matches = []
+    truncated = False
+
+    for line_number, text in enumerate(document["content"].splitlines(), start=1):
+        if query not in text:
+            continue
+
+        if len(matches) == max_matches:
+            truncated = True
+            break
+
+        matches.append({"line": line_number, "text": text})
+
+    return {
+        "path": document["path"],
+        "matches": matches,
+        "truncated": truncated,
+    }
+
+
+def find_symbols(workspace: Path, path: str) -> dict[str, object]:
+    """Find up to twenty top-level definitions in a permitted Python file.
+
+    Args:
+        workspace (Path): Directory that bounds file access.
+        path (str): Workspace-relative path to a Python source file.
+
+    Returns:
+        dict[str, object]: Resolved relative path, a symbols list containing
+            each definition's name, kind, and one-based line number, and
+            a truncated boolean indicating whether more definitions exist.
+            Nested functions and class methods are excluded.
+
+    Raises:
+        ValueError: The path lacks a .py suffix, source syntax is invalid,
+            or read_file rejects the file's content or size.
+        PermissionError: File access violates the workspace policy.
+        OSError: A filesystem operation fails.
+    """
+    if Path(path).suffix != ".py":
+        raise ValueError("find_symbols requires a .py file")
+
+    document = read_file(workspace, path)
+
+    try:
+        tree = ast.parse(document["content"], filename=document["path"])
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid Python syntax at line {exc.lineno}") from exc
+
+    kinds = {
+        ast.FunctionDef: "function",
+        ast.AsyncFunctionDef: "async_function",
+        ast.ClassDef: "class",
+    }
+    symbols = []
+    truncated = False
+
+    for node in tree.body:
+        kind = kinds.get(type(node))
+        if kind is None:
+            continue
+
+        if len(symbols) == 20:
+            truncated = True
+            break
+
+        symbols.append(
+            {
+                "name": node.name,
+                "kind": kind,
+                "line": node.lineno,
+            }
+        )
+
+    return {
+        "path": document["path"],
+        "symbols": symbols,
+        "truncated": truncated,
+    }
